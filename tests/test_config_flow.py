@@ -190,19 +190,27 @@ async def test_reauth_flow_replaces_credentials(hass):
     assert result["type"] == FlowResultType.FORM
     assert result["step_id"] == "reauth_confirm"
 
-    with patch(
-        "custom_components.estfeed.config_flow.EstfeedClient.list_metering_points",
-        new=AsyncMock(return_value=[_meter()]),
+    # A successful reauth schedules a reload of the entry. Stub the setup it
+    # runs and wait for it: left running, the real setup queries the recorder
+    # while teardown closes the database, which can segfault SQLite.
+    with (
+        patch(
+            "custom_components.estfeed.config_flow.EstfeedClient.list_metering_points",
+            new=AsyncMock(return_value=[_meter()]),
+        ),
+        patch("custom_components.estfeed.async_setup_entry", return_value=True) as mock_setup,
     ):
         result2 = await hass.config_entries.flow.async_configure(
             result["flow_id"],
             user_input={CONF_CLIENT_ID: "new", CONF_CLIENT_SECRET: "new"},
         )
+        await hass.async_block_till_done()
 
     assert result2["type"] == FlowResultType.ABORT
     assert result2["reason"] == "reauth_successful"
     assert entry.data[CONF_CLIENT_ID] == "new"
     assert entry.data[CONF_CLIENT_SECRET] == "new"
+    mock_setup.assert_called_once()
 
 
 @pytest.mark.asyncio
