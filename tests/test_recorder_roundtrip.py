@@ -8,6 +8,7 @@ database exposes.
 
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -29,7 +30,12 @@ from custom_components.estfeed.const import (
 )
 from custom_components.estfeed.coordinator import EstfeedCoordinator
 from custom_components.estfeed.nps import NpsError
-from custom_components.estfeed.statistics import StatisticStream, async_write_meter_statistics
+from custom_components.estfeed.statistics import (
+    CostStream,
+    StatisticStream,
+    async_write_cost_statistics,
+    async_write_meter_statistics,
+)
 
 EIC = "38ZEE-00720089-N"
 CONSUMPTION_ID = "estfeed:home_consumption_089n"
@@ -149,6 +155,32 @@ async def test_meter_statistics_are_accepted_by_the_recorder(hass, unit, kwh, m3
     await async_write_meter_statistics(hass, stream, [interval], prior_sum=0.0)
 
     assert await _last_sum(hass, stream.statistic_id) == 2.5
+
+
+async def test_cost_statistics_are_accepted_without_a_unit_class_warning(hass, caplog):
+    """Cost rows must land in the recorder on every supported HA, and without
+    the missing-``unit_class`` warning that becomes an error in HA 2026.11.
+
+    EUR has no unit converter, so the recorder expects ``unit_class: None``
+    sent explicitly; recorders before 2025.11 reject the key altogether.
+    """
+    stream = CostStream(statistic_id=COST_ID, name="home cost", unit="EUR", kind=Kind.CONSUMPTION)
+    hour = datetime(2026, 4, 27, 10, tzinfo=UTC)
+    interval = AccountingInterval(
+        period_start=hour,
+        consumption_kwh=2.0,
+        production_kwh=None,
+        consumption_m3=None,
+        production_m3=None,
+    )
+
+    await async_write_cost_statistics(
+        hass, stream, [interval], {hour: 0.05}, lambda spot: spot, prior_sum=0.0
+    )
+
+    assert await _last_sum(hass, COST_ID) == pytest.approx(0.10)
+    warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert not [w for w in warnings if "unit_class" in w]
 
 
 async def test_hourly_tick_imports_only_hours_after_the_stored_series(hass, freezer):

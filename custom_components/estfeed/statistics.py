@@ -169,7 +169,10 @@ def _publish_cost_rows(
     }
     if _MEAN_TYPE_NONE is not None:
         metadata["mean_type"] = _MEAN_TYPE_NONE  # type: ignore[typeddict-unknown-key]
-    # No unit_class — unit_class is for energy/volume/mass conversion, not currencies.
+    if _SUPPORTS_UNIT_CLASS:
+        # Currencies have no unit converter, but the recorder still wants the
+        # key present: a missing unit_class stops working in HA 2026.11.
+        metadata["unit_class"] = None  # type: ignore[typeddict-unknown-key]
     async_add_external_statistics(hass, metadata, rows)
     last_sum = rows[-1].get("sum")
     return float(last_sum) if last_sum is not None else prior_sum
