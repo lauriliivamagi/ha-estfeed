@@ -69,10 +69,16 @@ class CumulativeBaseline:
     ``frozen_sum + sum(cache slice)`` and stays correct past the cache window.
     ``reset_at`` is surfaced as HA's ``last_reset`` attribute so the Energy
     dashboard tolerates the reset without flagging it as a counter rollback.
+
+    ``folded_through`` is the ``period_start`` of the newest interval already
+    added to ``frozen_sum``. The backfill_history service and the cache
+    warm-up after a restart re-fetch history that has aged out before;
+    intervals at or before this point were counted the first time.
     """
 
     reset_at: datetime
     frozen_sum: float = 0.0
+    folded_through: datetime | None = None
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -455,16 +461,6 @@ class EstfeedCoordinator(DataUpdateCoordinator[None]):
         else:
             for stream in streams:
                 per_stream_start[stream.statistic_id] = await self._latest_seen_for_stream(stream)
-        # One API call covers all kinds. Fetch from the earliest seen so a
-        # lagging stream can backfill its gap, but bound by the caller's
-        # `start` on regular ticks — otherwise a stream stuck far in the
-        # past (e.g., a single non-null production reading from 12 months
-        # ago for a consume-only meter that has been null since) would
-        # force every tick to download a year of data and exceed HA's
-        # bootstrap stage-2 timeout. force_start callers (initial backfill,
-        # warm cache, manual service) still get the full window.
-        seen = [s for s in per_stream_start.values() if s is not None]
-        fetch_start = start if force_start or not seen else max(start, min(seen))
         # Read prior_sum ONCE before the chunk loop (per stream) and advance
         # locally as we write. HA's recorder may not flush statistics writes
         # synchronously, so re-reading get_last_statistics inside the loop
@@ -510,6 +506,22 @@ class EstfeedCoordinator(DataUpdateCoordinator[None]):
                     if force_start
                     else await self._prior_sum_for_stream(fake)
                 )
+        # One API call covers all kinds. Fetch from the earliest seen so a
+        # lagging stream can backfill its gap, but bound by the caller's
+        # `start` on regular ticks — otherwise a stream stuck far in the
+        # past (e.g., a single non-null production reading from 12 months
+        # ago for a consume-only meter that has been null since) would
+        # force every tick to download a year of data and exceed HA's
+        # bootstrap stage-2 timeout. force_start callers (initial backfill,
+        # warm cache, manual service) still get the full window. Cost
+        # streams count too: a tick whose price fetch failed still writes
+        # energy, so the cost series lags and its hours must be re-fetched.
+        seen = [
+            s
+            for s in (*per_stream_start.values(), *cost_per_stream_start.values())
+            if s is not None
+        ]
+        fetch_start = start if force_start or not seen else max(start, min(seen))
         tariff = self._build_tariff() if cost_streams else None
         cursor = fetch_start
         while cursor < end:
@@ -594,10 +606,12 @@ class EstfeedCoordinator(DataUpdateCoordinator[None]):
         rows = last_stats.get(stream.statistic_id)
         if not rows:
             return None
-        end_ms = rows[0].get("end")
-        if end_ms is None:
+        # The recorder returns row timestamps as epoch seconds (only the
+        # websocket API converts them to milliseconds).
+        end_ts = rows[0].get("end")
+        if end_ts is None:
             return None
-        return datetime.fromtimestamp(end_ms / 1000.0, tz=UTC)
+        return datetime.fromtimestamp(end_ts, tz=UTC)
 
     async def _prior_sum_for_stream(self, stream: StatisticStream) -> float:
         last_stats = await get_instance(self.hass).async_add_executor_job(
@@ -648,12 +662,20 @@ class EstfeedCoordinator(DataUpdateCoordinator[None]):
             # lose data once a long-running baseline pushes past 62 days.
             if baseline is None or expiring.period_start < baseline.reset_at:
                 continue
+            # Re-fetched history (backfill_history, the cache warm-up after a
+            # restart) ages out again; it was counted the first time.
+            if (
+                baseline.folded_through is not None
+                and expiring.period_start <= baseline.folded_through
+            ):
+                continue
             value = interval_value(expiring, kind)
             if value is None:
                 continue
             self.baselines[(eic, kind)] = CumulativeBaseline(
                 reset_at=baseline.reset_at,
                 frozen_sum=baseline.frozen_sum + float(value),
+                folded_through=expiring.period_start,
             )
             baseline = self.baselines[(eic, kind)]
             self._baselines_dirty = True
@@ -735,17 +757,27 @@ class EstfeedCoordinator(DataUpdateCoordinator[None]):
             _LOGGER.info("No persisted baselines found; starting fresh")
             return
         entries = (data.get("baselines") or {}).items()
+        # Entries saved before ``folded_through`` existed: the previous run
+        # folded what aged out of its cache, so treat the current cache edge
+        # as already folded rather than counting re-fetched history again.
+        legacy_folded_through = datetime.now(tz=UTC) - timedelta(days=ROLLING_CACHE_DAYS)
         loaded = 0
         for raw_key, raw_val in entries:
             try:
                 eic, kind_value = raw_key.rsplit("|", 1)
                 kind = Kind(kind_value)
+                if "folded_through" in raw_val:
+                    raw_folded = raw_val["folded_through"]
+                    folded_through = datetime.fromisoformat(raw_folded) if raw_folded else None
+                else:
+                    folded_through = legacy_folded_through
                 self.baselines[(eic, kind)] = CumulativeBaseline(
                     reset_at=datetime.fromisoformat(raw_val["reset_at"]),
                     frozen_sum=float(raw_val.get("frozen_sum", 0.0)),
+                    folded_through=folded_through,
                 )
                 loaded += 1
-            except (KeyError, ValueError) as err:
+            except (KeyError, TypeError, ValueError) as err:
                 _LOGGER.warning("Skipping malformed baseline entry %r: %s", raw_key, err)
         _LOGGER.info("Loaded %d baseline(s) from storage", loaded)
 
@@ -763,6 +795,7 @@ class EstfeedCoordinator(DataUpdateCoordinator[None]):
                 f"{eic}|{kind.value}": {
                     "reset_at": b.reset_at.isoformat(),
                     "frozen_sum": b.frozen_sum,
+                    "folded_through": b.folded_through.isoformat() if b.folded_through else None,
                 }
                 for (eic, kind), b in self.baselines.items()
             }

@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from unittest.mock import Mock, patch
 
 import pytest
+from homeassistant.const import MAJOR_VERSION, MINOR_VERSION
 
 from custom_components.estfeed.api import AccountingInterval
 from custom_components.estfeed.const import Kind
@@ -20,6 +21,10 @@ from custom_components.estfeed.statistics import (
     compute_statistic_rows,
     eic_suffix,
 )
+
+# The recorder gained a unit_class metadata column in HA 2025.11; older
+# recorders reject an import that carries the key.
+HA_HAS_UNIT_CLASS = (MAJOR_VERSION, MINOR_VERSION) >= (2025, 11)
 
 
 def test_eic_suffix():
@@ -164,8 +169,8 @@ async def test_async_write_meter_statistics_calls_external_stats(hass):
     assert metadata["unit_of_measurement"] == "kWh"
     assert metadata["has_sum"] is True
     assert metadata["has_mean"] is False
-    # unit_class becomes mandatory in HA 2026.11; kWh maps to energy.
-    assert metadata["unit_class"] == "energy"
+    # kWh maps to unit_class=energy wherever the recorder supports the key.
+    assert metadata.get("unit_class") == ("energy" if HA_HAS_UNIT_CLASS else None)
     assert len(rows) == 1
     assert rows[0]["sum"] == 1.0
     # Returns final running sum so multi-chunk callers can chain prior_sum.
@@ -200,7 +205,7 @@ async def test_async_write_meter_statistics_sets_volume_unit_class_for_gas(hass)
 
     metadata = mock_add.call_args.args[1]
     assert metadata["unit_of_measurement"] == "m³"
-    assert metadata["unit_class"] == "volume"
+    assert metadata.get("unit_class") == ("volume" if HA_HAS_UNIT_CLASS else None)
 
 
 @pytest.mark.asyncio

@@ -6,6 +6,7 @@ from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from homeassistant.helpers.storage import Store
 
 from custom_components.estfeed.api import (
     AccountingInterval,
@@ -126,7 +127,7 @@ async def test_coordinator_uses_latest_seen_as_start(hass, freezer):
 
     last_seen_ts = datetime(2026, 4, 28, 23, tzinfo=UTC).timestamp()
     fake_last_stats = {
-        "estfeed:home_consumption_089n": [{"end": last_seen_ts * 1000}],  # ms
+        "estfeed:home_consumption_089n": [{"end": last_seen_ts}],  # epoch seconds, as HA returns
     }
 
     with (
@@ -1127,6 +1128,112 @@ def test_update_cache_folds_expiring_intervals_into_frozen_sum(hass):
     assert baseline.frozen_sum == 4.0
     # Cumulative = frozen 4 + cached 1 = 5
     assert coordinator.cumulative_since_reset(eic, Kind.CONSUMPTION) == 5.0
+
+
+# 100 days of 1.0 kWh/h from _RESET_AT up to 2026-05-05 12:00 UTC: 2400 kWh.
+# At 12:05 the 62-day cache cutoff is 2026-03-04 12:05, so the 913 hours up
+# to and including 03-04 12:00 are folded into frozen_sum and 1487 stay cached.
+_RESET_AT = datetime(2026, 1, 25, 12, tzinfo=UTC)
+_BASELINES_KEY = "estfeed.test.baselines"
+
+
+def _hourly_client() -> MagicMock:
+    """Estfeed client returning 1.0 kWh for every hour of any requested window."""
+
+    async def _data(start, end, resolution, eics=None):  # noqa: ARG001
+        hours = int((end - start) / timedelta(hours=1))
+        return [MeterData(eic="38ZEE-00720089-N", intervals=_hourly(start, hours, kwh=1.0))]
+
+    client = MagicMock()
+    client.get_metering_data = AsyncMock(side_effect=_data)
+    return client
+
+
+def test_refetched_aged_out_intervals_are_not_folded_twice(hass, freezer):
+    """Regression: the backfill_history service re-fetches history that has
+    already aged out of the cache. Each interval may count toward
+    ``frozen_sum`` only once."""
+    freezer.move_to("2026-05-05 12:05:00+00:00")
+    coordinator = EstfeedCoordinator(hass=hass, client=MagicMock(), slug="home", options={})
+    eic = "38ZEE-00720089-N"
+    coordinator.baselines[(eic, Kind.CONSUMPTION)] = CumulativeBaseline(reset_at=_RESET_AT)
+    history = _hourly(_RESET_AT, 2400, kwh=1.0)
+    coordinator._update_cache(eic, Kind.CONSUMPTION, history)
+    assert coordinator.cumulative_since_reset(eic, Kind.CONSUMPTION) == 2400.0
+
+    coordinator._update_cache(eic, Kind.CONSUMPTION, history)
+
+    assert coordinator.cumulative_since_reset(eic, Kind.CONSUMPTION) == 2400.0
+
+
+async def _restart_and_warm_cache(
+    hass, freezer, at: str = "2026-05-05 12:40:00+00:00"
+) -> EstfeedCoordinator:
+    """Simulate HA restarting at ``at`` (default: inside the hour of the last fold)."""
+    freezer.move_to(at)
+    coordinator = EstfeedCoordinator(hass=hass, client=_hourly_client(), slug="home", options={})
+    coordinator.meters = [_make_meter()]
+    coordinator.attach_store(Store(hass, 1, _BASELINES_KEY))
+    await coordinator.async_load_baselines()
+    await coordinator.async_warm_cache()
+    return coordinator
+
+
+async def test_cache_warm_up_after_restart_does_not_fold_the_edge_hour_again(hass, freezer):
+    """Regression: after a restart in the same clock hour as the last fold,
+    the cache warm-up re-fetches the hour at the 62-day edge (03-04 12:00),
+    which the previous run already folded."""
+    eic = "38ZEE-00720089-N"
+    freezer.move_to("2026-05-05 12:05:00+00:00")
+    before = EstfeedCoordinator(hass=hass, client=MagicMock(), slug="home", options={})
+    before.attach_store(Store(hass, 1, _BASELINES_KEY))
+    before.baselines[(eic, Kind.CONSUMPTION)] = CumulativeBaseline(reset_at=_RESET_AT)
+    before._update_cache(eic, Kind.CONSUMPTION, _hourly(_RESET_AT, 2400, kwh=1.0))
+    await before._flush_baselines_if_dirty()
+
+    after = await _restart_and_warm_cache(hass, freezer)
+
+    assert after.cumulative_since_reset(eic, Kind.CONSUMPTION) == 2400.0
+
+
+async def test_cache_warm_up_after_restart_folds_the_hour_that_aged_out_meanwhile(hass, freezer):
+    """A restart an hour later re-fetches from 03-04 13:00, an hour the
+    previous run never folded. The persisted fold position must let it count
+    (12:00 was folded before; 13:00 is new)."""
+    eic = "38ZEE-00720089-N"
+    freezer.move_to("2026-05-05 12:05:00+00:00")
+    before = EstfeedCoordinator(hass=hass, client=MagicMock(), slug="home", options={})
+    before.attach_store(Store(hass, 1, _BASELINES_KEY))
+    before.baselines[(eic, Kind.CONSUMPTION)] = CumulativeBaseline(reset_at=_RESET_AT)
+    before._update_cache(eic, Kind.CONSUMPTION, _hourly(_RESET_AT, 2400, kwh=1.0))
+    await before._flush_baselines_if_dirty()
+
+    after = await _restart_and_warm_cache(hass, freezer, at="2026-05-05 13:10:00+00:00")
+
+    # 01-25 12:00 through 05-05 12:00 inclusive: 2401 hours.
+    assert after.cumulative_since_reset(eic, Kind.CONSUMPTION) == 2401.0
+
+
+async def test_baselines_saved_by_older_versions_do_not_fold_the_edge_hour_again(
+    hass, hass_storage, freezer
+):
+    """Baselines stored before the fold position was tracked must not count
+    the re-fetched edge hour a second time either."""
+    eic = "38ZEE-00720089-N"
+    hass_storage[_BASELINES_KEY] = {
+        "version": 1,
+        "minor_version": 1,
+        "key": _BASELINES_KEY,
+        "data": {
+            "baselines": {
+                f"{eic}|consumption": {"reset_at": _RESET_AT.isoformat(), "frozen_sum": 913.0}
+            }
+        },
+    }
+
+    after = await _restart_and_warm_cache(hass, freezer)
+
+    assert after.cumulative_since_reset(eic, Kind.CONSUMPTION) == 2400.0
 
 
 # ---- Task 6 tests: cost_streams_for, _build_tariff, last_nps_error ----
