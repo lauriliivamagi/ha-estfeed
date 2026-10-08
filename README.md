@@ -3,6 +3,9 @@
 [![Validate](https://img.shields.io/github/actions/workflow/status/tehisain/ha-estfeed/validate.yml?branch=main&label=validate)](https://github.com/tehisain/ha-estfeed/actions/workflows/validate.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
+> [!NOTE]
+> This is a personal fork of [tehisain/ha-estfeed](https://github.com/tehisain/ha-estfeed).
+
 Imports [Elering Estfeed](https://estfeed.elering.ee/) meter data into Home Assistant's Energy dashboard, with daily, monthly and cumulative sensors.
 
 Polls hourly. Meter readings can arrive late; this is not a real-time power monitor.
